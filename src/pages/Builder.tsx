@@ -29,6 +29,13 @@ type BuildStage =
   | "ready"
   | "error";
 
+type PendingWrite = {
+  id: number;
+  filePath: string;
+  full: string;
+  cursor: number;
+};
+
 
 export function Builder() {
   const location = useLocation();
@@ -65,7 +72,10 @@ export function Builder() {
 
   const parserRef = useRef<BoltStreamParser>(new BoltStreamParser());
 
-  const initStartdRef = useRef(false)
+  const initStartdRef = useRef(false);
+
+  const typingQueueRef = useRef<PendingWrite[]>([]);
+  const typingTimerRef = useRef<number | null>(null)
 
   //generating different keys for different prompts
   const cacheKey = useMemo(
@@ -231,6 +241,76 @@ export function Builder() {
   }, [hydrated, webcontainer, steps, createMountStructure]);
 
 
+  const upsertFileTree = (tree: FileItem[], path: string, content: string) => {
+    const nextFiles: FileItem[] = structuredClone(tree);
+
+    const parts = path.split("/").filter(Boolean);
+    let cursor = nextFiles;
+    let currentPath = "";
+
+    for (let i = 0; i < parts.length; i++) {
+      const name = parts[i];
+      currentPath += `/${name}`;
+      const isLast = i === parts.length - 1;
+
+      const existing = cursor.find((x) => x.path === currentPath);
+
+      if (isLast) {
+        if (!existing) cursor.push({ name, type: "file", path: currentPath, content });
+        else if (existing.type === "file") existing.content = content;
+      } else {
+        if (!existing) cursor.push({ name, type: "folder", path: currentPath, children: [] });
+        const folder = cursor.find((x) => x.path === currentPath);
+        if (!folder || folder.type !== "folder") return nextFiles;
+        cursor = folder.children!;
+      }
+    }
+
+    return nextFiles;
+  };
+
+
+  const startTypingEngine = () => {
+  if (typingTimerRef.current) return;
+
+  typingTimerRef.current = window.setInterval(async () => {
+    const q = typingQueueRef.current;
+    if (!q.length) {
+      if (typingTimerRef.current) {
+        clearInterval(typingTimerRef.current);
+        typingTimerRef.current = null;
+      }
+      return;
+    }
+
+    const current = q[0];
+
+    // reveal speed
+    const CHARS_PER_TICK = 30; // tweak: 10-60
+    current.cursor = Math.min(current.full.length, current.cursor + CHARS_PER_TICK);
+
+    const visible = current.full.slice(0, current.cursor);
+
+    // update file tree (UI typing)
+    setFiles((prev) => upsertFileTree(prev, current.filePath, visible));
+
+    // done typing this file
+    if (current.cursor >= current.full.length) {
+      // write FULL content to webcontainer (real FS)
+      if (webcontainer) {
+        await writeFileAtPath(current.filePath, current.full);
+      }
+
+      // mark step complete
+      setSteps((prev) =>
+        prev.map((s) => (s.id === current.id ? { ...s, status: "completed" } : s))
+      );
+
+      q.shift(); // remove finished file
+    }
+  }, 16); // ~60fps
+};
+
 
   const runChatStreaming = async (
     messages: Array<{ role: "user" | "assistant", content: string }>,
@@ -271,12 +351,21 @@ export function Builder() {
                 let maxId = prev.reduce((m, x) => Math.max(m, x.id), 0);
                 const nextId = maxId + 1;
 
+                typingQueueRef.current.push({
+                  id: nextId,
+                  filePath: a.filePath,
+                  full: a.content,
+                  cursor: 0,
+                });
+
+                startTypingEngine();
+
                 return [
                   ...prev,
                   {
                     id: nextId,
                     type: StepType.CreateFile,
-                    status: "pending",
+                    status: "in-progress",
                     title: `Create ${a.filePath}`,
                     description: `Generated ${a.filePath}`,
                     path: a.filePath,
